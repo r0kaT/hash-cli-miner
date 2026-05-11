@@ -31,7 +31,7 @@ const OFFICIAL_WASM_JS = path.join(__dirname, "vendor", "hash_miner.js");
 const OFFICIAL_WASM_BIN = path.join(__dirname, "vendor", "hash_miner_bg.wasm");
 const CUDA_BIN = path.join(__dirname, "hash256-cuda-miner");
 const DEFAULT_WASM_BATCH = 1_000_000;
-const DEFAULT_CUDA_BATCH = 512_000_000;
+const DEFAULT_CUDA_BATCH = 4_096_000_000;
 const DEFAULT_MINE_ROUND_SECONDS = 60;
 
 function parseArgs(argv) {
@@ -64,20 +64,25 @@ function usage() {
 
 Usage:
   node hash256-cli.js status [--address 0x...]
-  node hash256-cli.js bench [--seconds 5]
+  node hash256-cli.js bench [--seconds 5] [--gpus 8]
   node hash256-cli.js tune [--seconds 4] [--batches 64000000,256000000,512000000]
   node hash256-cli.js solve --challenge 0x... --difficulty 0x...
-  node hash256-cli.js mine --address 0x... [--loop]
-  node hash256-cli.js mine --submit [--private-key 0x...] [--loop]
+  node hash256-cli.js mine --address 0x... [--loop] [--gpus 8]
+  node hash256-cli.js mine --submit [--private-key 0x...] [--loop] [--gpus 8]
 
 Environment:
   HASH256_RPC_URL     Ethereum RPC, default ${DEFAULT_RPC}
   PRIVATE_KEY         Optional private key for --submit; can be set in .env
 
+Multi-GPU:
+  --gpus N            Use N GPUs (default: all available). Optimized for 8xH100.
+  --batch N           Total batch across all GPUs (default: ${DEFAULT_CUDA_BATCH.toLocaleString()}).
+
 Notes:
   - --address is read-only; PRIVATE_KEY/--private-key is required to submit.
   - --loop refreshes chain challenge between mining rounds.
   - Requires built hash256-cuda-miner binary (run: sh build-cuda.sh).
+  - For H100: use CUDA_ARCH=sm_90 (default). For A100: CUDA_ARCH=sm_80.
   - Submitting mine() costs Ethereum gas. Use --submit only with your own key.`);
 }
 
@@ -268,7 +273,7 @@ async function mineWithMetal({ challenge, difficulty, batchSize, seconds, progre
   });
 }
 
-async function mineWithCuda({ challenge, difficulty, batchSize, seconds, progressEveryMs, quiet }) {
+async function mineWithCuda({ challenge, difficulty, batchSize, seconds, progressEveryMs, quiet, gpus }) {
   if (!(await fileExists(CUDA_BIN))) {
     throw new Error("CUDA miner missing; run: sh build-cuda.sh");
   }
@@ -284,6 +289,7 @@ async function mineWithCuda({ challenge, difficulty, batchSize, seconds, progres
     "--progress-ms",
     String(progressEveryMs),
   ];
+  if (gpus) args.push("--gpus", String(gpus));
   if (seconds) args.push("--cutoff-ms", String(Date.now() + seconds * 1000));
 
   const child = spawn(CUDA_BIN, args, {
@@ -365,6 +371,7 @@ async function mineSolution(options) {
   throw new Error(`unknown engine: ${engine}`);
 }
 
+
 function verifySolution(challenge, nonce, difficulty) {
   const digest = keccak256(concat([hexToBytes(toBytes32Hex(challenge)), hexToBytes(toBytes32Hex(nonce))]));
   const ok = BigInt(digest) < BigInt(toBytes32Hex(difficulty));
@@ -436,6 +443,7 @@ async function runBench(args) {
     batchSize: args.batch ? Number(args.batch) : undefined,
     seconds,
     progressEveryMs: Number(args["progress-ms"] || 1000),
+    gpus: args.gpus ? Number(args.gpus) : undefined,
   });
   const rate = Number(result.hashes) / Math.max(0.001, result.elapsedMs / 1000);
   console.log(`bench: ${result.backend} · ${result.hashes.toLocaleString()} hashes · ${formatHashRate(rate)}`);
@@ -488,6 +496,7 @@ async function runSolve(args) {
     batchSize: args.batch ? Number(args.batch) : undefined,
     seconds: args.seconds ? Number(args.seconds) : 0,
     progressEveryMs: Number(args["progress-ms"] || 1000),
+    gpus: args.gpus ? Number(args.gpus) : undefined,
   });
   if (!result.nonce) {
     console.log(`no solution before cutoff · ${result.hashes.toLocaleString()} hashes`);
@@ -584,6 +593,7 @@ async function runMineRound({ args, client, rpc, privateKey, address }) {
     batchSize: args.batch ? Number(args.batch) : undefined,
     seconds: roundSeconds,
     progressEveryMs: Number(args["progress-ms"] || 1000),
+    gpus: args.gpus ? Number(args.gpus) : undefined,
   });
 
   if (!result.nonce) {
