@@ -28,8 +28,6 @@ echo "compiling with $NVCC for $ARCH ..."
 
 $NVCC -std=c++17 -O3 \
   -arch="$ARCH" \
-  --ptxas-options=-v \
-  -t 0 \
   -Xcompiler -pthread \
   hash256-cuda-miner.cu \
   -o hash256-cuda-miner \

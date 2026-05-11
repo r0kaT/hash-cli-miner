@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -144,6 +145,7 @@ struct ResultBuffer {
     unsigned int pad;
     uint64_t nonce_counter;
     uint64_t hash[4];
+    uint64_t prefix[3];  // prefix used when this result was found
 };
 
 // ---------------------------------------------------------------------------
@@ -208,6 +210,9 @@ hash256_mine(const Uniforms* __restrict__ u,
                 result->hash[1] = h1;
                 result->hash[2] = h2;
                 result->hash[3] = h3;
+                result->prefix[0] = pr0;
+                result->prefix[1] = pr1;
+                result->prefix[2] = pr2;
             }
             return;
         }
@@ -315,7 +320,6 @@ struct GpuState {
 
     unsigned int numBlocks;
     uint64_t     batchHashes;
-    uint64_t     nonceBase;
 };
 
 static void initGpu(GpuState& gs, int dev, uint64_t batchPerGpu) {
@@ -334,7 +338,6 @@ static void initGpu(GpuState& gs, int dev, uint64_t batchPerGpu) {
     unsigned int maxBlocks = (unsigned int)gs.sm_count * 24;
     gs.numBlocks = (unsigned int)std::min(blocks64, (uint64_t)maxBlocks);
     gs.batchHashes = (uint64_t)gs.numBlocks * THREADS_PER_BLOCK * hashesPerThread;
-    gs.nonceBase = 0;
 
     fprintf(stderr, "  GPU %d: %u blocks × %d threads × %d iter = %llu hashes/launch\n",
             dev, gs.numBlocks, THREADS_PER_BLOCK, ITERATIONS,
@@ -369,6 +372,7 @@ struct GpuResult {
     int status;       // 1=found, 0=expired, -1=error
     uint64_t nonce_counter;
     uint64_t hash[4];
+    uint64_t prefix[3];  // prefix used when result was found
     uint64_t totalHashes;
     int gpu_id;
     std::string error;
@@ -390,10 +394,25 @@ static void mineOnGpu(GpuState& gs,
     uint64_t started = nowSteadyMs();
     uint64_t lastProgress = started;
 
+    // Per-thread RNG seeded with device id + high-res clock
+    std::random_device rd;
+    std::mt19937_64 rng(rd() ^ (uint64_t)gs.device_id ^
+                        (uint64_t)std::chrono::high_resolution_clock::now()
+                            .time_since_epoch().count());
+    std::uniform_uint_distribution<uint64_t> u64dist(0, UINT64_MAX);
+
+    // Helper: generate random 24-byte prefix, reset nonce base to 0
+    auto randomizePrefix = [&](Uniforms* u) {
+        u->prefix[0] = u64dist(rng);
+        u->prefix[1] = u64dist(rng);
+        u->prefix[2] = u64dist(rng);
+        u->nonce_base = 0;
+    };
+
     // Launch first batch on stream 0
     {
         memcpy(gs.h_uniforms[0], &baseUniforms, sizeof(Uniforms));
-        gs.h_uniforms[0]->nonce_base = gs.nonceBase;
+        randomizePrefix(gs.h_uniforms[0]);
         memset(gs.h_result[0], 0, sizeof(ResultBuffer));
 
         CUDA_CHECK(cudaMemcpyAsync(gs.d_uniforms[0], gs.h_uniforms[0],
@@ -405,8 +424,6 @@ static void mineOnGpu(GpuState& gs,
         hash256_mine<<<gs.numBlocks, THREADS_PER_BLOCK, 0, gs.streams[0]>>>(
             gs.d_uniforms[0], gs.d_result[0]);
         CUDA_CHECK(cudaEventRecord(gs.kernel_done[0], gs.streams[0]));
-
-        gs.nonceBase += (uint64_t)numGpus * gs.batchHashes;
     }
 
     int cur = 0;
@@ -417,9 +434,9 @@ static void mineOnGpu(GpuState& gs,
 
         int next = (cur + 1) % NUM_STREAMS;
 
-        // Prepare & launch next batch (async — overlaps with cur kernel)
+        // Prepare & launch next batch with random prefix (async — overlaps with cur kernel)
         memcpy(gs.h_uniforms[next], &baseUniforms, sizeof(Uniforms));
-        gs.h_uniforms[next]->nonce_base = gs.nonceBase;
+        randomizePrefix(gs.h_uniforms[next]);
         memset(gs.h_result[next], 0, sizeof(ResultBuffer));
 
         CUDA_CHECK(cudaMemcpyAsync(gs.d_uniforms[next], gs.h_uniforms[next],
@@ -431,8 +448,6 @@ static void mineOnGpu(GpuState& gs,
         hash256_mine<<<gs.numBlocks, THREADS_PER_BLOCK, 0, gs.streams[next]>>>(
             gs.d_uniforms[next], gs.d_result[next]);
         CUDA_CHECK(cudaEventRecord(gs.kernel_done[next], gs.streams[next]));
-
-        gs.nonceBase += (uint64_t)numGpus * gs.batchHashes;
 
         // Wait for current stream's kernel, read result
         CUDA_CHECK(cudaEventSynchronize(gs.kernel_done[cur]));
@@ -450,6 +465,9 @@ static void mineOnGpu(GpuState& gs,
             out.hash[1] = gs.h_result[cur]->hash[1];
             out.hash[2] = gs.h_result[cur]->hash[2];
             out.hash[3] = gs.h_result[cur]->hash[3];
+            out.prefix[0] = gs.h_result[cur]->prefix[0];
+            out.prefix[1] = gs.h_result[cur]->prefix[1];
+            out.prefix[2] = gs.h_result[cur]->prefix[2];
             globalFound.store(true, std::memory_order_relaxed);
             break;
         }
@@ -504,8 +522,6 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Initializing GPUs...\n");
         for (int g = 0; g < numGpus; g++) {
             initGpu(gpuStates[g], g, batchPerGpu);
-            // Partition nonce space: GPU g starts at g * batchHashes
-            gpuStates[g].nonceBase = (uint64_t)g * gpuStates[g].batchHashes;
         }
 
         std::atomic<bool> globalFound{false};
@@ -545,8 +561,14 @@ int main(int argc, char** argv) {
 
         if (foundGpu >= 0) {
             auto& r = results[foundGpu];
+            // Reconstruct prefix bytes from the winning result's uint64[3] LE words
+            std::vector<uint8_t> resultPrefix(24, 0);
+            for (int i = 0; i < 3; i++) {
+                uint64_t w = r.prefix[i];
+                for (int j = 0; j < 8; j++) resultPrefix[i * 8 + j] = (uint8_t)((w >> (j * 8)) & 0xff);
+            }
             std::cout << "{\"type\":\"found\",\"gpu\":" << foundGpu
-                      << ",\"nonce\":\"" << nonceHex(prefixBytes, r.nonce_counter)
+                      << ",\"nonce\":\"" << nonceHex(resultPrefix, r.nonce_counter)
                       << "\",\"hash\":\"" << u64BeToHex(r.hash, 4)
                       << "\",\"hashes\":\"" << totalHashes
                       << "\",\"elapsedMs\":" << elapsed << "}" << std::endl;
