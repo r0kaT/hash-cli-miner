@@ -399,7 +399,7 @@ static void mineOnGpu(GpuState& gs,
     std::mt19937_64 rng(rd() ^ (uint64_t)gs.device_id ^
                         (uint64_t)std::chrono::high_resolution_clock::now()
                             .time_since_epoch().count());
-    std::uniform_uint_distribution<uint64_t> u64dist(0, UINT64_MAX);
+    std::uniform_int_distribution<uint64_t> u64dist(0, UINT64_MAX);
 
     // Helper: generate random 24-byte prefix, reset nonce base to 0
     auto randomizePrefix = [&](Uniforms* u) {
