@@ -35,12 +35,22 @@ __device__ __constant__ uint64_t KECCAK_RC[24] = {
     0x0000000080000001ULL, 0x8000000080008008ULL,
 };
 
+// Challenge & difficulty are fixed for the entire round — stash in constant
+// memory so the kernel reads them from the constant cache instead of pulling
+// them from global memory via the Uniforms struct every launch.
+__device__ __constant__ uint64_t c_challenge[4];
+__device__ __constant__ uint64_t c_difficulty[4];
+
 // ---------------------------------------------------------------------------
 // Kernel constants — tuned for H100 (sm_90, 132 SMs)
 // ---------------------------------------------------------------------------
-static constexpr int ITERATIONS = 32;
+static constexpr int ITERATIONS = 64;
 static constexpr int THREADS_PER_BLOCK = 512;
 static constexpr int NUM_STREAMS = 2;
+// Resident-blocks-per-SM upper bound. With __launch_bounds__(512, 2) only 2
+// blocks fit per SM anyway, so queueing 8 waves keeps each kernel small enough
+// that early-exit responds quickly while still amortizing launch overhead.
+static constexpr int BLOCKS_PER_SM = 8;
 
 // ---------------------------------------------------------------------------
 // Device helpers
@@ -54,6 +64,19 @@ __device__ __forceinline__ uint64_t bswap64(uint64_t v) {
     v = ((v & 0x0000FFFF0000FFFFULL) << 16) | ((v & 0xFFFF0000FFFF0000ULL) >> 16);
     v = ((v & 0x00FF00FF00FF00FFULL) <<  8) | ((v & 0xFF00FF00FF00FF00ULL) >>  8);
     return v;
+}
+
+// Keccak Chi step: a ^ ((~b) & c). Fuses the NOT/AND/XOR triple into one
+// LOP3 instruction on sm_50+ via the lookup-table immediate 0xD2 — saves two
+// ALU ops per word per round (so 50 ops per round, 1200 over the full f1600).
+__device__ __forceinline__ uint64_t chi(uint64_t a, uint64_t b, uint64_t c) {
+    uint32_t a_lo = (uint32_t)a, a_hi = (uint32_t)(a >> 32);
+    uint32_t b_lo = (uint32_t)b, b_hi = (uint32_t)(b >> 32);
+    uint32_t c_lo = (uint32_t)c, c_hi = (uint32_t)(c >> 32);
+    uint32_t r_lo, r_hi;
+    asm("lop3.b32 %0, %1, %2, %3, 0xD2;" : "=r"(r_lo) : "r"(a_lo), "r"(b_lo), "r"(c_lo));
+    asm("lop3.b32 %0, %1, %2, %3, 0xD2;" : "=r"(r_hi) : "r"(a_hi), "r"(b_hi), "r"(c_hi));
+    return ((uint64_t)r_hi << 32) | r_lo;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,31 +123,31 @@ __device__ __forceinline__ void keccak_f1600(uint64_t s[25]) {
         uint64_t b19 = rotl64(s[23] ^ D3, 56);
         uint64_t b04 = rotl64(s[24] ^ D4, 14);
 
-        s[ 0] = b00 ^ (~b01 & b02);
-        s[ 1] = b01 ^ (~b02 & b03);
-        s[ 2] = b02 ^ (~b03 & b04);
-        s[ 3] = b03 ^ (~b04 & b00);
-        s[ 4] = b04 ^ (~b00 & b01);
-        s[ 5] = b05 ^ (~b06 & b07);
-        s[ 6] = b06 ^ (~b07 & b08);
-        s[ 7] = b07 ^ (~b08 & b09);
-        s[ 8] = b08 ^ (~b09 & b05);
-        s[ 9] = b09 ^ (~b05 & b06);
-        s[10] = b10 ^ (~b11 & b12);
-        s[11] = b11 ^ (~b12 & b13);
-        s[12] = b12 ^ (~b13 & b14);
-        s[13] = b13 ^ (~b14 & b10);
-        s[14] = b14 ^ (~b10 & b11);
-        s[15] = b15 ^ (~b16 & b17);
-        s[16] = b16 ^ (~b17 & b18);
-        s[17] = b17 ^ (~b18 & b19);
-        s[18] = b18 ^ (~b19 & b15);
-        s[19] = b19 ^ (~b15 & b16);
-        s[20] = b20 ^ (~b21 & b22);
-        s[21] = b21 ^ (~b22 & b23);
-        s[22] = b22 ^ (~b23 & b24);
-        s[23] = b23 ^ (~b24 & b20);
-        s[24] = b24 ^ (~b20 & b21);
+        s[ 0] = chi(b00, b01, b02);
+        s[ 1] = chi(b01, b02, b03);
+        s[ 2] = chi(b02, b03, b04);
+        s[ 3] = chi(b03, b04, b00);
+        s[ 4] = chi(b04, b00, b01);
+        s[ 5] = chi(b05, b06, b07);
+        s[ 6] = chi(b06, b07, b08);
+        s[ 7] = chi(b07, b08, b09);
+        s[ 8] = chi(b08, b09, b05);
+        s[ 9] = chi(b09, b05, b06);
+        s[10] = chi(b10, b11, b12);
+        s[11] = chi(b11, b12, b13);
+        s[12] = chi(b12, b13, b14);
+        s[13] = chi(b13, b14, b10);
+        s[14] = chi(b14, b10, b11);
+        s[15] = chi(b15, b16, b17);
+        s[16] = chi(b16, b17, b18);
+        s[17] = chi(b17, b18, b19);
+        s[18] = chi(b18, b19, b15);
+        s[19] = chi(b19, b15, b16);
+        s[20] = chi(b20, b21, b22);
+        s[21] = chi(b21, b22, b23);
+        s[22] = chi(b22, b23, b24);
+        s[23] = chi(b23, b24, b20);
+        s[24] = chi(b24, b20, b21);
 
         s[0] ^= KECCAK_RC[r];
     }
@@ -133,9 +156,9 @@ __device__ __forceinline__ void keccak_f1600(uint64_t s[25]) {
 // ---------------------------------------------------------------------------
 // GPU uniforms & result
 // ---------------------------------------------------------------------------
+// Only per-launch varying inputs live here. Challenge and difficulty are
+// uploaded to __constant__ memory once per round.
 struct Uniforms {
-    uint64_t challenge[4];
-    uint64_t difficulty[4];
     uint64_t prefix[3];
     uint64_t nonce_base;
 };
@@ -157,20 +180,21 @@ hash256_mine(const Uniforms* __restrict__ u,
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t thread_start = gid * ITERATIONS;
 
-    const uint64_t ch0 = u->challenge[0];
-    const uint64_t ch1 = u->challenge[1];
-    const uint64_t ch2 = u->challenge[2];
-    const uint64_t ch3 = u->challenge[3];
+    // Challenge & difficulty come from constant memory (cached, broadcast-friendly).
+    const uint64_t ch0 = c_challenge[0];
+    const uint64_t ch1 = c_challenge[1];
+    const uint64_t ch2 = c_challenge[2];
+    const uint64_t ch3 = c_challenge[3];
     const uint64_t pr0 = u->prefix[0];
     const uint64_t pr1 = u->prefix[1];
     const uint64_t pr2 = u->prefix[2];
-    const uint64_t d0  = u->difficulty[0];
-    const uint64_t d1  = u->difficulty[1];
-    const uint64_t d2  = u->difficulty[2];
-    const uint64_t d3  = u->difficulty[3];
+    const uint64_t d0  = c_difficulty[0];
+    const uint64_t d1  = c_difficulty[1];
+    const uint64_t d2  = c_difficulty[2];
+    const uint64_t d3  = c_difficulty[3];
     const uint64_t base = u->nonce_base;
 
-    #pragma unroll 4
+    #pragma unroll 8
     for (int k = 0; k < ITERATIONS; k++) {
         const uint64_t counter = base + thread_start + k;
 
@@ -335,7 +359,10 @@ static void initGpu(GpuState& gs, int dev, uint64_t batchPerGpu) {
     uint64_t hashesPerThread = ITERATIONS;
     uint64_t threadsNeeded = (batchPerGpu + hashesPerThread - 1) / hashesPerThread;
     uint64_t blocks64 = (threadsNeeded + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    unsigned int maxBlocks = (unsigned int)gs.sm_count * 24;
+    // Cap at BLOCKS_PER_SM waves — H100 only fits 2 blocks/SM resident under
+    // current launch_bounds, so 8 queued waves is plenty; less queue depth =
+    // faster early-exit when a solution is found.
+    unsigned int maxBlocks = (unsigned int)gs.sm_count * BLOCKS_PER_SM;
     gs.numBlocks = (unsigned int)std::min(blocks64, (uint64_t)maxBlocks);
     gs.batchHashes = (uint64_t)gs.numBlocks * THREADS_PER_BLOCK * hashesPerThread;
 
@@ -413,13 +440,11 @@ static void mineOnGpu(GpuState& gs,
     {
         memcpy(gs.h_uniforms[0], &baseUniforms, sizeof(Uniforms));
         randomizePrefix(gs.h_uniforms[0]);
-        memset(gs.h_result[0], 0, sizeof(ResultBuffer));
 
         CUDA_CHECK(cudaMemcpyAsync(gs.d_uniforms[0], gs.h_uniforms[0],
                                     sizeof(Uniforms), cudaMemcpyHostToDevice,
                                     gs.streams[0]));
-        CUDA_CHECK(cudaMemcpyAsync(gs.d_result[0], gs.h_result[0],
-                                    sizeof(ResultBuffer), cudaMemcpyHostToDevice,
+        CUDA_CHECK(cudaMemsetAsync(gs.d_result[0], 0, sizeof(ResultBuffer),
                                     gs.streams[0]));
         hash256_mine<<<gs.numBlocks, THREADS_PER_BLOCK, 0, gs.streams[0]>>>(
             gs.d_uniforms[0], gs.d_result[0]);
@@ -437,13 +462,11 @@ static void mineOnGpu(GpuState& gs,
         // Prepare & launch next batch with random prefix (async — overlaps with cur kernel)
         memcpy(gs.h_uniforms[next], &baseUniforms, sizeof(Uniforms));
         randomizePrefix(gs.h_uniforms[next]);
-        memset(gs.h_result[next], 0, sizeof(ResultBuffer));
 
         CUDA_CHECK(cudaMemcpyAsync(gs.d_uniforms[next], gs.h_uniforms[next],
                                     sizeof(Uniforms), cudaMemcpyHostToDevice,
                                     gs.streams[next]));
-        CUDA_CHECK(cudaMemcpyAsync(gs.d_result[next], gs.h_result[next],
-                                    sizeof(ResultBuffer), cudaMemcpyHostToDevice,
+        CUDA_CHECK(cudaMemsetAsync(gs.d_result[next], 0, sizeof(ResultBuffer),
                                     gs.streams[next]));
         hash256_mine<<<gs.numBlocks, THREADS_PER_BLOCK, 0, gs.streams[next]>>>(
             gs.d_uniforms[next], gs.d_result[next]);
@@ -510,9 +533,13 @@ int main(int argc, char** argv) {
 
         Uniforms baseUniforms;
         memset(&baseUniforms, 0, sizeof(baseUniforms));
-        for (int i = 0; i < 4; i++) baseUniforms.challenge[i] = le64(challengeBytes, i * 8);
-        for (int i = 0; i < 4; i++) baseUniforms.difficulty[i] = be64(difficultyBytes, i * 8);
         for (int i = 0; i < 3; i++) baseUniforms.prefix[i] = le64(prefixBytes, i * 8);
+
+        // Challenge/difficulty live in __constant__ memory — upload once per device.
+        uint64_t hostChallenge[4];
+        uint64_t hostDifficulty[4];
+        for (int i = 0; i < 4; i++) hostChallenge[i]  = le64(challengeBytes, i * 8);
+        for (int i = 0; i < 4; i++) hostDifficulty[i] = be64(difficultyBytes, i * 8);
 
         uint64_t batchPerGpu = (requestedBatch + numGpus - 1) / numGpus;
         uint64_t align = (uint64_t)THREADS_PER_BLOCK * ITERATIONS;
@@ -522,6 +549,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Initializing GPUs...\n");
         for (int g = 0; g < numGpus; g++) {
             initGpu(gpuStates[g], g, batchPerGpu);
+            CUDA_CHECK(cudaSetDevice(g));
+            CUDA_CHECK(cudaMemcpyToSymbol(c_challenge, hostChallenge,
+                                          sizeof(hostChallenge)));
+            CUDA_CHECK(cudaMemcpyToSymbol(c_difficulty, hostDifficulty,
+                                          sizeof(hostDifficulty)));
         }
 
         std::atomic<bool> globalFound{false};
