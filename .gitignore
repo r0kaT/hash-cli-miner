@@ -1,4 +1,6 @@
 node_modules/
+vendor/hash_miner.js
+vendor/hash_miner_bg.wasm
 hash256-metal-miner
 hash256-cuda-miner
 *.dSYM/
